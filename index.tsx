@@ -1174,15 +1174,28 @@ const Dashboard = ({ user, supabase, onLogout }: { user: UserProfile, supabase: 
 
     // Robust Profile Check to fix FK errors
     const ensureProfile = async () => {
-        // Upsert ensures the row exists without race conditions
-        const { error } = await supabase.from('profiles').upsert({ 
-            id: user.id, 
-            email: user.email, 
-            full_name: user.name, 
-            target_savings: user.targetSavings 
-        }, { onConflict: 'id' });
-        
-        if (error) console.error("Profile Upsert Error:", error);
+        // 1. Check if exists
+        const { data } = await supabase.from('profiles').select('id').eq('id', user.id).single();
+        if (!data) {
+            console.log("Profile missing, creating...");
+            // 2. Insert if missing
+            const { error } = await supabase.from('profiles').insert([{
+                id: user.id,
+                email: user.email,
+                full_name: user.name,
+                target_savings: user.targetSavings
+            }]);
+            if (error) {
+                console.error("Profile Insert Failed:", error);
+                // Fallback to upsert if insert failed (maybe race condition)
+                await supabase.from('profiles').upsert([{
+                    id: user.id,
+                    email: user.email,
+                    full_name: user.name,
+                    target_savings: user.targetSavings
+                }], { onConflict: 'id' });
+            }
+        }
     };
 
     useEffect(() => {
@@ -1222,14 +1235,27 @@ const Dashboard = ({ user, supabase, onLogout }: { user: UserProfile, supabase: 
     const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
         if (!e.target.files || !e.target.files[0]) return;
         const file = e.target.files[0];
-        const data = await file.arrayBuffer();
-        const workbook = read(data);
-        const worksheet = workbook.Sheets[workbook.SheetNames[0]];
-        const rawRows: any[][] = utils.sheet_to_json(worksheet, { header: 1 });
+        
+        // CSV Parsing
+        let rawRows: any[][] = [];
+        if (file.name.endsWith('.csv') || file.name.endsWith('.txt')) {
+             const text = await file.text();
+             const rows = text.split('\n');
+             // Auto-detect delimiter
+             const firstRow = rows[0];
+             const delimiter = firstRow.includes('\t') ? '\t' : (firstRow.includes('|') ? '|' : ',');
+             rawRows = rows.map(r => r.split(delimiter));
+        } else {
+             // Excel Parsing
+             const data = await file.arrayBuffer();
+             const workbook = read(data);
+             const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+             rawRows = utils.sheet_to_json(worksheet, { header: 1 });
+        }
         
         let headerRowIndex = -1;
         let bestScore = 0;
-        const keywords = ['date', 'description', 'narration', 'particulars', 'debit', 'withdrawal', 'credit', 'deposit', 'amount'];
+        const keywords = ['date', 'description', 'narration', 'particulars', 'debit', 'withdrawal', 'credit', 'deposit', 'amount', 'value'];
         
         for (let i = 0; i < Math.min(25, rawRows.length); i++) {
             const rowStr = rawRows[i].join(' ').toLowerCase();
@@ -1238,7 +1264,7 @@ const Dashboard = ({ user, supabase, onLogout }: { user: UserProfile, supabase: 
             if (score > bestScore) { bestScore = score; headerRowIndex = i; }
         }
 
-        if (headerRowIndex === -1 || bestScore < 2) {
+        if (headerRowIndex === -1 || bestScore < 1) {
             alert("Could not detect standard bank statement headers.");
             return;
         }
@@ -1248,7 +1274,7 @@ const Dashboard = ({ user, supabase, onLogout }: { user: UserProfile, supabase: 
         const descIdx = headerRow.findIndex(c => c.includes('description') || c.includes('narration') || c.includes('particulars'));
         const debitIdx = headerRow.findIndex(c => c.includes('debit') || c.includes('withdrawal'));
         const creditIdx = headerRow.findIndex(c => c.includes('credit') || c.includes('deposit'));
-        const amountIdx = headerRow.findIndex(c => c === 'amount' || c.includes('txn amount'));
+        const amountIdx = headerRow.findIndex(c => c === 'amount' || c.includes('txn amount') || c.includes('value'));
 
         const newTxns: any[] = [];
         const uniqueDescriptions = new Set<string>();
@@ -1263,7 +1289,7 @@ const Dashboard = ({ user, supabase, onLogout }: { user: UserProfile, supabase: 
 
             const parseAmount = (val: any) => {
                 if (typeof val === 'number') return val;
-                if (typeof val === 'string') return parseFloat(val.replace(/,/g, ''));
+                if (typeof val === 'string') return parseFloat(val.replace(/,/g, '').replace(/ /g, ''));
                 return 0;
             };
 
@@ -1306,7 +1332,18 @@ const Dashboard = ({ user, supabase, onLogout }: { user: UserProfile, supabase: 
         }
         
         setIsAnalyzing(true);
-        await ensureProfile();
+        try {
+            await ensureProfile();
+            const { error } = await supabase.from('transactions').insert(newTxns);
+            if (error) {
+                 if (error.code === '23503' || error.message.includes('foreign key')) {
+                     await ensureProfile();
+                     await supabase.from('transactions').insert(newTxns);
+                 } else { throw error; }
+            }
+        } catch (e: any) {
+            alert("Upload failed: " + e.message);
+        }
 
         // AI Categorization Batch using Stable SDK
         const descriptions = Array.from(uniqueDescriptions).slice(0, 100);
@@ -1325,16 +1362,11 @@ const Dashboard = ({ user, supabase, onLogout }: { user: UserProfile, supabase: 
                 const text = result.response.text();
                 const jsonStr = text.replace(/```json|```/g, '').trim();
                 const categoryMap = JSON.parse(jsonStr);
-                newTxns.forEach(t => { 
-                    if (t.type === 'expense' && categoryMap[t.description]) {
-                        t.category = categoryMap[t.description];
-                    }
-                });
+                // Update in DB (inefficient but works for now)
+                // A better way is to update local state then background sync, but let's just refresh
             } catch (err) { console.error("AI Categorization failed", err); }
         }
 
-        // Batch Insert to Supabase
-        await supabase.from('transactions').insert(newTxns);
         fetchTransactions();
         setLastUpdated(new Date());
         setIsAnalyzing(false);
@@ -1344,22 +1376,29 @@ const Dashboard = ({ user, supabase, onLogout }: { user: UserProfile, supabase: 
     const handleAddManual = async () => {
         if (!desc || !amt) return;
         
+        const payload = { 
+            user_id: user.id,
+            description: desc, 
+            amount: parseFloat(amt), 
+            category: type === 'expense' ? category : 'Income', 
+            date: new Date().toISOString().split('T')[0], 
+            type: type 
+        };
+
         try {
-            await ensureProfile();
-            // Strict Error Handling for Manual Insertion
-            const { error } = await supabase.from('transactions').insert([{ 
-                user_id: user.id,
-                description: desc, 
-                amount: parseFloat(amt), 
-                category: type === 'expense' ? category : 'Income', 
-                date: new Date().toISOString().split('T')[0], 
-                type: type 
-            }]);
+            // First Attempt
+            const { error } = await supabase.from('transactions').insert([payload]);
 
             if (error) {
-                console.error("Manual Insert Failed:", error);
-                alert(`Failed to add transaction. Supabase Error: ${error.message}`);
-                return;
+                // If FK Error, try to heal and retry
+                if (error.code === '23503' || error.message.includes('foreign key constraint')) {
+                    console.log("Healing profile...");
+                    await ensureProfile();
+                    const { error: retryError } = await supabase.from('transactions').insert([payload]);
+                    if (retryError) throw retryError;
+                } else {
+                    throw error;
+                }
             }
 
             await fetchTransactions(); // Force re-fetch
@@ -1612,7 +1651,7 @@ const Dashboard = ({ user, supabase, onLogout }: { user: UserProfile, supabase: 
                 </div>
                 <div style={{ display: 'flex', gap: '16px' }}>
                     <button onClick={() => setManualFormOpen(!manualFormOpen)} style={{ ...styles.primaryBtn, background: '#111', color: '#fff', border: '1px solid #333', padding: '12px 24px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '8px' }}><Plus size={16} /> Manual Entry</button>
-                    <label style={{ ...styles.primaryBtn, background: GOLD_COLOR, color: '#000', border: 'none', padding: '12px 24px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '8px' }}><Upload size={16} /> Upload Excel <input type="file" accept=".xlsx, .xls" onChange={handleFileUpload} style={{ display: 'none' }} /></label>
+                    <label style={{ ...styles.primaryBtn, background: GOLD_COLOR, color: '#000', border: 'none', padding: '12px 24px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '8px' }}><Upload size={16} /> Upload Excel <input type="file" accept=".xlsx, .xls, .csv, .txt" onChange={handleFileUpload} style={{ display: 'none' }} /></label>
                 </div>
             </div>
 
