@@ -1177,25 +1177,26 @@ const Dashboard = ({ user, supabase, onLogout }: { user: UserProfile, supabase: 
     const [dbError, setDbError] = useState<string | null>(null);
 
     const ensureProfile = async () => {
-        // Robust Self-Healing: Checks existence first to satisfy Foreign Key
-        const { data: existing } = await supabase.from('profiles').select('id').eq('id', user.id).single();
-        
-        if (!existing) {
-            // If not exists, try to insert. Ignore if race condition happens.
-            const { error } = await supabase.from('profiles').insert([{
+        // Robust Self-Healing: Use upsert to guarantee profile exists
+        const { error } = await supabase.from('profiles').upsert(
+            {
                 id: user.id,
                 email: user.email,
                 full_name: user.name,
                 target_savings: user.targetSavings || 50000
-            }]);
-            if (error && error.code !== '23505') { // 23505 is duplicate key
-                 console.error("Profile creation failed:", error);
-            }
+            },
+            { onConflict: 'id', ignoreDuplicates: true }
+        );
+        
+        if (error) {
+             console.error("Profile creation failed:", error);
+             setDbError("Failed to verify user profile. Transaction may fail.");
+             throw new Error("Profile check failed");
         }
     };
 
     useEffect(() => {
-        ensureProfile();
+        ensureProfile().catch(e => console.error(e));
     }, [user, supabase]);
 
     // Fetch Transactions
@@ -1377,7 +1378,7 @@ const Dashboard = ({ user, supabase, onLogout }: { user: UserProfile, supabase: 
         };
 
         try {
-            await ensureProfile(); // Force Check/Create Profile
+            await ensureProfile(); // Force Check/Create Profile before inserting txn
             const { error } = await supabase.from('transactions').insert([payload]);
 
             if (error) throw error;
